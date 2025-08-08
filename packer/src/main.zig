@@ -4,6 +4,7 @@ const Sector = struct {
     district: DistrictCode,
     code: u8,
     units: []RawUnit,
+    z_index: u64,
 };
 
 const lat_min = 49.9;
@@ -15,6 +16,7 @@ const RawUnit = struct {
     code: u16,
     lat_index: u32,
     lon_index: u32,
+    z_index: u64,
 };
 
 const Postcode = struct {
@@ -79,7 +81,26 @@ fn parseLine(district_map: *DistrictCodeMap, line: [*]const u8, bytes_remaining:
     };
 }
 
-/// Everything owned by caller, make sure to clean up
+fn createSector(allocator: std.mem.Allocator, district: DistrictCode, code: u8, units: []const RawUnit) !Sector {
+    var sector = Sector{
+        .district = district,
+        .code = code,
+        .units = try allocator.dupe(RawUnit, units),
+        .z_index = 0,
+    };
+
+    std.sort.block(RawUnit, sector.units, @as(usize, 0), sortUnitsFn);
+
+    var zIndexSum: usize = 0;
+    for (sector.units) |unit| {
+        zIndexSum +|= unit.z_index;
+    }
+
+    sector.z_index = zIndexSum / units.len;
+
+    return sector;
+}
+
 fn parseToSectors(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, csv_contents: []const u8) ![]Sector {
     var bytesRemaining = csv_contents.len;
     var index: usize = 0;
@@ -97,13 +118,7 @@ fn parseToSectors(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, 
     while (true) {
         const line = parseLine(district_map, csv_contents[index..].ptr, bytesRemaining) catch |err| switch (err) {
             error.EOF => {
-                const sector = Sector{
-                    .district = lastDistrict,
-                    .code = lastSector,
-                    .units = try allocator.alloc(RawUnit, units.items.len),
-                };
-
-                @memcpy(sector.units, units.items);
+                const sector = try createSector(allocator, lastDistrict, lastSector, units.items);
                 try sectors.append(sector);
                 break;
             },
@@ -111,20 +126,19 @@ fn parseToSectors(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, 
         };
 
         if (line.postcode.district != lastDistrict or line.postcode.sector != lastSector) {
-            const sector = Sector{
-                .district = lastDistrict,
-                .code = lastSector,
-                .units = try allocator.alloc(RawUnit, units.items.len),
-            };
-            @memcpy(sector.units, units.items);
+            const sector = try createSector(allocator, lastDistrict, lastSector, units.items);
             try sectors.append(sector);
             units.clearRetainingCapacity();
         }
 
+        const lat_index: u32 = @intFromFloat((line.latitude - lat_min) / lat_res);
+        const lon_index: u32 = @intFromFloat((line.longitude - lon_min) / lon_res);
+
         try units.append(RawUnit{
             .code = line.postcode.unit,
-            .lat_index = @intFromFloat((line.latitude - lat_min) / lat_res),
-            .lon_index = @intFromFloat((line.longitude - lon_min) / lon_res),
+            .lat_index = lat_index,
+            .lon_index = lon_index,
+            .z_index = interleave_bits(interleave_bits(lat_index, lon_index), line.postcode.unit),
         });
 
         lastSector = line.postcode.sector;
@@ -143,8 +157,46 @@ const DistrictCodePair = struct {
     index: DistrictCode,
 };
 
+fn spread_bits(n: u64) u64 {
+    var x: u64 = n & 0xFFFFFFFF;
+    x = (x | (x << 16)) & 0x0000FFFF0000FFFF;
+    x = (x | (x << 8)) & 0x00FF00FF00FF00FF;
+    x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0F;
+    x = (x | (x << 2)) & 0x3333333333333333;
+    x = (x | (x << 1)) & 0x5555555555555555;
+    return x;
+}
+
+fn interleave_bits(x: u64, y: u64) u64 {
+    return (spread_bits(x) << 1) | spread_bits(y);
+}
+
+fn zigzag(n: i32) u32 {
+    return @intCast((n << 1) ^ (n >> 31));
+}
+
+fn sortUnitsFn(_: usize, lhs: RawUnit, rhs: RawUnit) bool {
+    return lhs.z_index < rhs.z_index;
+}
+
+fn sortSectorFn(_: usize, lhs: Sector, rhs: Sector) bool {
+    return lhs.z_index < rhs.z_index;
+}
+
 fn sortDistrictCodesFn(_: usize, lhs: DistrictCodePair, rhs: DistrictCodePair) bool {
     return lhs.index < rhs.index;
+}
+
+fn unitToBytes(unit: RawUnit) [5]u8 {
+    const coordinates: u28 = @intCast((unit.lat_index << 14) | unit.lon_index);
+    const unit_code: u40 = (@as(u40, unit.code) << 28) | coordinates;
+    return .{
+        @intCast((unit_code >> 32) & 0xFF),
+        @intCast((unit_code >> 24) & 0xFF),
+        @intCast((unit_code >> 16) & 0xFF),
+        @intCast((unit_code >> 8) & 0xFF),
+        @intCast(unit_code & 0xFF),
+    };
 }
 
 fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sectors: []const Sector) !std.ArrayList(u8) {
@@ -163,6 +215,10 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sec
 
     std.sort.block(DistrictCodePair, district_buffer, @as(usize, 0), sortDistrictCodesFn);
 
+    const owned_sectors = try allocator.dupe(Sector, sectors);
+    defer allocator.free(owned_sectors);
+    std.sort.block(Sector, owned_sectors, @as(usize, 0), sortSectorFn);
+
     var bundle = std.ArrayList(u8).init(allocator);
 
     try bundle.appendSlice(&std.mem.toBytes(@as(u16, @intCast(district_buffer.len))));
@@ -170,25 +226,46 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sec
         try bundle.appendSlice(district.code);
     }
 
+    var lastUnit: ?RawUnit = null;
     var units: usize = 0;
-    for (sectors) |sector| {
+    for (owned_sectors) |sector| {
         // ~3200 districts max (u12) + 10 sectors (u4)
         const sector_code: u16 = (sector.district << 12) | sector.code;
         try bundle.appendSlice(&std.mem.toBytes(sector_code));
 
         try bundle.appendSlice(&std.mem.toBytes(@as(u16, @intCast(sector.units.len))));
         for (sector.units) |unit| {
-            const coordinates: u28 = @intCast((unit.lat_index << 14) | unit.lon_index);
-            const unit_code: u40 = (@as(u40, unit.code) << 28) | coordinates;
-            const unit_bytes: [5]u8 = .{
-                @intCast((unit_code >> 32) & 0xFF),
-                @intCast((unit_code >> 24) & 0xFF),
-                @intCast((unit_code >> 16) & 0xFF),
-                @intCast((unit_code >> 8) & 0xFF),
-                @intCast(unit_code & 0xFF),
-            };
-            try bundle.appendSlice(&unit_bytes);
+            if (lastUnit) |lu| {
+                const delta = [3]u32{
+                    zigzag(@as(i32, lu.code) - @as(i32, unit.code)),
+                    zigzag(@as(i32, @intCast(lu.lat_index)) - @as(i32, @intCast(unit.lat_index))),
+                    zigzag(@as(i32, @intCast(lu.lon_index)) - @as(i32, @intCast(unit.lon_index))),
+                };
+
+                // code has less grouping, give it priority
+                if (delta[0] < 2048 and delta[1] < 64 and delta[1] < 128) {
+                    const delta_code: u24 = @intCast(delta[0]);
+                    const delta_lat: u24 = @intCast(delta[1]);
+                    const delta_lon: u24 = @intCast(delta[2]);
+
+                    const unit_delta: u24 = (1 << 23) | (delta_code << 12) | (delta_lat << 6) | delta_lon;
+                    const unit_bytes: [3]u8 = .{
+                        @intCast((unit_delta >> 16) & 0xFF),
+                        @intCast((unit_delta >> 8) & 0xFF),
+                        @intCast(unit_delta & 0xFF),
+                    };
+                    try bundle.appendSlice(&unit_bytes);
+
+                    units += 1;
+                    lastUnit = unit;
+                    continue;
+                }
+            }
+
+            try bundle.appendSlice(&unitToBytes(unit));
+
             units += 1;
+            lastUnit = unit;
         }
     }
 
