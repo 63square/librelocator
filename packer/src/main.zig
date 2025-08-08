@@ -1,15 +1,21 @@
 const DistrictCode = u16;
-const District = struct { index: DistrictCode, sectors: [10]Sector };
 
-const Sector = ?[]Unit;
+const Sector = struct {
+    district: DistrictCode,
+    code: u8,
+    units: []RawUnit,
+};
 
 const lat_min = 49.9;
 const lon_min = -8.6;
 const lat_res = 0.001;
 const lon_res = 0.001;
 
-// unit code + coordinates
-const Unit = [5]u8;
+const RawUnit = struct {
+    code: u16,
+    lat_index: u32,
+    lon_index: u32,
+};
 
 const Postcode = struct {
     district: DistrictCode,
@@ -74,71 +80,52 @@ fn parseLine(district_map: *DistrictCodeMap, line: [*]const u8, bytes_remaining:
 }
 
 /// Everything owned by caller, make sure to clean up
-fn parseToDistricts(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, csv_contents: []const u8) ![]District {
+fn parseToSectors(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, csv_contents: []const u8) ![]Sector {
     var bytesRemaining = csv_contents.len;
     var index: usize = 0;
     var lines: usize = 0;
     defer std.debug.print("[*] Parsed {d} postcodes\n", .{lines});
 
-    var districts = std.ArrayList(District).init(allocator);
+    var sectors = std.ArrayList(Sector).init(allocator);
 
     var lastDistrict: DistrictCode = 0;
     var lastSector: u8 = 0;
 
-    var district: District = undefined;
-    var sector: std.ArrayList(Unit) = std.ArrayList(Unit).init(allocator);
-    defer sector.deinit();
+    var units: std.ArrayList(RawUnit) = std.ArrayList(RawUnit).init(allocator);
+    defer units.deinit();
 
     while (true) {
         const line = parseLine(district_map, csv_contents[index..].ptr, bytesRemaining) catch |err| switch (err) {
             error.EOF => {
-                district.sectors[lastSector] = try allocator.alloc(Unit, sector.items.len);
-                @memcpy(district.sectors[lastSector].?, sector.items);
-                try districts.append(district);
+                const sector = Sector{
+                    .district = lastDistrict,
+                    .code = lastSector,
+                    .units = try allocator.alloc(RawUnit, units.items.len),
+                };
+
+                @memcpy(sector.units, units.items);
+                try sectors.append(sector);
                 break;
             },
             else => return err,
         };
 
-        if (line.postcode.district == lastDistrict) {
-            if (line.postcode.sector != lastSector) {
-                district.sectors[lastSector] = try allocator.alloc(Unit, sector.items.len);
-                @memcpy(district.sectors[lastSector].?, sector.items);
-                sector.clearRetainingCapacity();
-            }
-        } else {
-            if (sector.items.len > 1) {
-                district.sectors[lastSector] = try allocator.alloc(Unit, sector.items.len);
-                @memcpy(district.sectors[lastSector].?, sector.items);
-                sector.clearRetainingCapacity();
-            } else {
-                district.sectors[lastSector] = null;
-            }
-
-            try districts.append(district);
-
-            district = District{
-                .index = line.postcode.district,
-                .sectors = undefined,
+        if (line.postcode.district != lastDistrict or line.postcode.sector != lastSector) {
+            const sector = Sector{
+                .district = lastDistrict,
+                .code = lastSector,
+                .units = try allocator.alloc(RawUnit, units.items.len),
             };
-            @memset(&district.sectors, null);
+            @memcpy(sector.units, units.items);
+            try sectors.append(sector);
+            units.clearRetainingCapacity();
         }
 
-        const lat_index: u32 = @intFromFloat((line.latitude - lat_min) / lat_res);
-        const lon_index: u32 = @intFromFloat((line.longitude - lon_min) / lon_res);
-
-        const coordinates: u28 = @intCast((lat_index << 14) | lon_index);
-
-        const code: u40 = line.postcode.unit;
-        const unit: u40 = (code << 28) | coordinates;
-        const unit_bytes: [5]u8 = .{
-            @intCast((unit >> 32) & 0xFF),
-            @intCast((unit >> 24) & 0xFF),
-            @intCast((unit >> 16) & 0xFF),
-            @intCast((unit >> 8) & 0xFF),
-            @intCast(unit & 0xFF),
-        };
-        try sector.append(unit_bytes);
+        try units.append(RawUnit{
+            .code = line.postcode.unit,
+            .lat_index = @intFromFloat((line.latitude - lat_min) / lat_res),
+            .lon_index = @intFromFloat((line.longitude - lon_min) / lon_res),
+        });
 
         lastSector = line.postcode.sector;
         lastDistrict = line.postcode.district;
@@ -148,7 +135,7 @@ fn parseToDistricts(allocator: std.mem.Allocator, district_map: *DistrictCodeMap
         lines += 1;
     }
 
-    return try districts.toOwnedSlice();
+    return try sectors.toOwnedSlice();
 }
 
 const DistrictCodePair = struct {
@@ -160,7 +147,7 @@ fn sortDistrictCodesFn(_: usize, lhs: DistrictCodePair, rhs: DistrictCodePair) b
     return lhs.index < rhs.index;
 }
 
-fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, districts: []const District) !std.ArrayList(u8) {
+fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sectors: []const Sector) !std.ArrayList(u8) {
     var districtMapIterator = district_map.iterator();
 
     const district_buffer = try allocator.alloc(DistrictCodePair, district_map.count());
@@ -184,17 +171,24 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, dis
     }
 
     var units: usize = 0;
-    for (districts) |district| {
-        for (district.sectors) |sector_n| {
-            if (sector_n) |sector| {
-                try bundle.appendSlice(&std.mem.toBytes(@as(u16, @intCast(sector.len))));
-                for (sector) |unit| {
-                    try bundle.appendSlice(&unit);
-                    units += 1;
-                }
-            } else {
-                try bundle.appendSlice("\x00\x00");
-            }
+    for (sectors) |sector| {
+        // ~3200 districts max (u12) + 10 sectors (u4)
+        const sector_code: u16 = (sector.district << 12) | sector.code;
+        try bundle.appendSlice(&std.mem.toBytes(sector_code));
+
+        try bundle.appendSlice(&std.mem.toBytes(@as(u16, @intCast(sector.units.len))));
+        for (sector.units) |unit| {
+            const coordinates: u28 = @intCast((unit.lat_index << 14) | unit.lon_index);
+            const unit_code: u40 = (@as(u40, unit.code) << 28) | coordinates;
+            const unit_bytes: [5]u8 = .{
+                @intCast((unit_code >> 32) & 0xFF),
+                @intCast((unit_code >> 24) & 0xFF),
+                @intCast((unit_code >> 16) & 0xFF),
+                @intCast((unit_code >> 8) & 0xFF),
+                @intCast(unit_code & 0xFF),
+            };
+            try bundle.appendSlice(&unit_bytes);
+            units += 1;
         }
     }
 
@@ -203,15 +197,11 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, dis
     return bundle;
 }
 
-fn deinitDistricts(allocator: std.mem.Allocator, districts: []const District) void {
-    for (districts) |district| {
-        for (district.sectors) |sector| {
-            if (sector) |s| {
-                allocator.free(s);
-            }
-        }
+fn deinitSectors(allocator: std.mem.Allocator, sectors: []const Sector) void {
+    for (sectors) |sector| {
+        allocator.free(sector.units);
     }
-    allocator.free(districts);
+    allocator.free(sectors);
 }
 
 pub fn main() !void {
@@ -230,10 +220,10 @@ pub fn main() !void {
     var districts_map = DistrictCodeMap.init(allocator);
     defer districts_map.deinit();
 
-    const districts = try parseToDistricts(allocator, &districts_map, file_data);
-    defer deinitDistricts(allocator, districts);
+    const sectors = try parseToSectors(allocator, &districts_map, file_data);
+    defer deinitSectors(allocator, sectors);
 
-    const bundle = try createBundle(allocator, districts_map, districts);
+    const bundle = try createBundle(allocator, districts_map, sectors);
     defer bundle.deinit();
 
     std.debug.print("[*] Writing bundle...\n", .{});
