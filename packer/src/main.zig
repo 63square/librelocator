@@ -3,11 +3,13 @@ const District = struct { index: DistrictCode, sectors: [10]Sector };
 
 const Sector = ?[]Unit;
 
-const Unit = struct {
-    code: u16,
-    longitude: f16,
-    latitude: f16,
-};
+const lat_min = 49.9;
+const lon_min = -8.6;
+const lat_res = 0.001;
+const lon_res = 0.001;
+
+// unit code + coordinates
+const Unit = [5]u8;
 
 const Postcode = struct {
     district: DistrictCode,
@@ -17,8 +19,8 @@ const Postcode = struct {
 
 const PostcodeLine = struct {
     postcode: Postcode,
-    longitude: f16,
-    latitude: f16,
+    longitude: f32,
+    latitude: f32,
     lineLength: usize,
 };
 
@@ -65,8 +67,8 @@ fn parseLine(district_map: *DistrictCodeMap, line: [*]const u8, bytes_remaining:
             .sector = sector,
             .unit = unit,
         },
-        .latitude = try std.fmt.parseFloat(f16, latitude_slice),
-        .longitude = try std.fmt.parseFloat(f16, longitude_slice),
+        .latitude = try std.fmt.parseFloat(f32, latitude_slice),
+        .longitude = try std.fmt.parseFloat(f32, longitude_slice),
         .lineLength = i + 1,
     };
 }
@@ -122,11 +124,21 @@ fn parseToDistricts(allocator: std.mem.Allocator, district_map: *DistrictCodeMap
             @memset(&district.sectors, null);
         }
 
-        try sector.append(Unit{
-            .code = line.postcode.unit,
-            .latitude = line.latitude,
-            .longitude = line.longitude,
-        });
+        const lat_index: u32 = @intFromFloat((line.latitude - lat_min) / lat_res);
+        const lon_index: u32 = @intFromFloat((line.longitude - lon_min) / lon_res);
+
+        const coordinates: u28 = @intCast((lat_index << 14) | lon_index);
+
+        const code: u40 = line.postcode.unit;
+        const unit: u40 = (code << 28) | coordinates;
+        const unit_bytes: [5]u8 = .{
+            @intCast((unit >> 32) & 0xFF),
+            @intCast((unit >> 24) & 0xFF),
+            @intCast((unit >> 16) & 0xFF),
+            @intCast((unit >> 8) & 0xFF),
+            @intCast(unit & 0xFF),
+        };
+        try sector.append(unit_bytes);
 
         lastSector = line.postcode.sector;
         lastDistrict = line.postcode.district;
@@ -149,14 +161,14 @@ fn sortDistrictCodesFn(_: usize, lhs: DistrictCodePair, rhs: DistrictCodePair) b
 }
 
 fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, districts: []const District) !std.ArrayList(u8) {
-    var mapIterator = district_map.iterator();
+    var districtMapIterator = district_map.iterator();
 
     const district_buffer = try allocator.alloc(DistrictCodePair, district_map.count());
     defer allocator.free(district_buffer);
 
-    var idx: usize = 0;
-    while (mapIterator.next()) |entry| : (idx += 1) {
-        district_buffer[idx] = DistrictCodePair{
+    var didx: usize = 0;
+    while (districtMapIterator.next()) |entry| : (didx += 1) {
+        district_buffer[didx] = DistrictCodePair{
             .code = entry.key_ptr.*,
             .index = entry.value_ptr.*,
         };
@@ -177,9 +189,7 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, dis
             if (sector_n) |sector| {
                 try bundle.appendSlice(&std.mem.toBytes(@as(u16, @intCast(sector.len))));
                 for (sector) |unit| {
-                    try bundle.appendSlice(&std.mem.toBytes(unit.code));
-                    try bundle.appendSlice(&std.mem.toBytes(unit.latitude));
-                    try bundle.appendSlice(&std.mem.toBytes(unit.longitude));
+                    try bundle.appendSlice(&unit);
                 }
             } else {
                 try bundle.appendSlice("\x00\x00");
