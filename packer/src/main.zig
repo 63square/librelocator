@@ -183,18 +183,22 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, dis
         try bundle.appendSlice(district.code);
     }
 
+    var units: usize = 0;
     for (districts) |district| {
         for (district.sectors) |sector_n| {
             if (sector_n) |sector| {
                 try bundle.appendSlice(&std.mem.toBytes(@as(u16, @intCast(sector.len))));
                 for (sector) |unit| {
                     try bundle.appendSlice(&unit);
+                    units += 1;
                 }
             } else {
                 try bundle.appendSlice("\x00\x00");
             }
         }
     }
+
+    std.debug.print("[*] Packed {d} postcodes to {d} KiB\n", .{ units, bundle.items.len / 1024 });
 
     return bundle;
 }
@@ -216,7 +220,6 @@ pub fn main() !void {
     const allocator = std.heap.smp_allocator;
 
     std.debug.print("[*] Started\n", .{});
-    defer std.debug.print("[*] Completed tasks\n", .{});
 
     // read entire file, 2 GiB allocation limit
     const file_data = try std.fs.cwd().readFileAlloc(allocator, file_path, 2 * 1024 * 1024 * 1024);
@@ -233,10 +236,14 @@ pub fn main() !void {
     const bundle = try createBundle(allocator, districts_map, districts);
     defer bundle.deinit();
 
-    std.debug.print("[*] Created bundle\n", .{});
+    std.debug.print("[*] Writing bundle...\n", .{});
 
-    const stdout = std.io.getStdOut();
-    try stdout.writeAll(bundle.items);
+    const bundle_file = try std.fs.cwd().createFile("out.bin", .{});
+    defer bundle_file.close();
+
+    try bundle_file.writeAll(bundle.items);
+
+    std.debug.print("[*] Completed tasks\n", .{});
 }
 
 const std = @import("std");
