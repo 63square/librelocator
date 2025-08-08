@@ -1,0 +1,7 @@
+.zig-cache
+zig-out
+
+ONSPD_MAY_2025_UK.csv
+districts.json
+
+out.bin
