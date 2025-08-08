@@ -184,7 +184,6 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, dis
     }
 
     for (districts) |district| {
-        try bundle.appendSlice(&std.mem.toBytes(district.index));
         for (district.sectors) |sector_n| {
             if (sector_n) |sector| {
                 try bundle.appendSlice(&std.mem.toBytes(@as(u16, @intCast(sector.len))));
