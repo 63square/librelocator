@@ -262,18 +262,17 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sec
                 };
 
                 // code has less grouping, give it priority
-                if (delta[0] < 2048 and delta[1] < 64 and delta[1] < 128) {
-                    const delta_code: u24 = @intCast(delta[0]);
-                    const delta_lat: u24 = @intCast(delta[1]);
-                    const delta_lon: u24 = @intCast(delta[2]);
+                const delta0_max = 1024;
+                const delta1_max = 64;
+                const delta2_max = 64;
+                if (delta[0] < delta0_max and delta[1] < delta1_max and delta[1] < delta2_max) {
+                    var encoded: u64 = delta[2] * (delta1_max + 1) * (delta0_max + 1) + delta[1] * (delta0_max + 1) + delta[0];
 
-                    const unit_delta: u24 = (1 << 23) | (delta_code << 12) | (delta_lat << 6) | delta_lon;
-                    const unit_bytes: [3]u8 = .{
-                        @intCast((unit_delta >> 16) & 0xFF),
-                        @intCast((unit_delta >> 8) & 0xFF),
-                        @intCast(unit_delta & 0xFF),
-                    };
-                    try bundle.appendSlice(&unit_bytes);
+                    while (encoded != 0) {
+                        const byte: u8 = @as(u8, @truncate(encoded)) & 0x7F;
+                        encoded >>= 7;
+                        try bundle.append(byte | 0x80);
+                    }
 
                     units += 1;
                     lastUnit = unit;
