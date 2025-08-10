@@ -7,10 +7,13 @@ const Sector = struct {
     z_index: u64,
 };
 
-const lat_min = 49.9;
-const lon_min = -8.6;
+const lat_min = 49.8;
+const lon_min = -8.2;
 const lat_res = 0.001;
 const lon_res = 0.001;
+
+const known_max_lat_index = 50200;
+const known_max_lon_index = 9960;
 
 const RawUnit = struct {
     code: u16,
@@ -115,6 +118,9 @@ fn parseToSectors(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, 
     var units: std.ArrayList(RawUnit) = std.ArrayList(RawUnit).init(allocator);
     defer units.deinit();
 
+    var max_lat_index: u16 = 0;
+    var max_lon_index: u16 = 0;
+
     while (true) {
         const line = parseLine(district_map, csv_contents[index..].ptr, bytesRemaining) catch |err| switch (err) {
             error.EOF => {
@@ -131,8 +137,13 @@ fn parseToSectors(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, 
             units.clearRetainingCapacity();
         }
 
-        const lat_index: u32 = @intFromFloat((line.latitude - lat_min) / lat_res);
-        const lon_index: u32 = @intFromFloat((line.longitude - lon_min) / lon_res);
+        const lat_index: u16 = @intFromFloat(@round((line.latitude - lat_min) / lat_res));
+        const lon_index: u16 = @intFromFloat(@round((line.longitude - lon_min) / lon_res));
+
+        if (lat_index > max_lat_index)
+            max_lat_index = lat_index;
+        if (lon_index > max_lon_index)
+            max_lon_index = lon_index;
 
         try units.append(RawUnit{
             .code = line.postcode.unit,
@@ -147,6 +158,14 @@ fn parseToSectors(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, 
         bytesRemaining -|= line.lineLength;
         index += line.lineLength;
         lines += 1;
+    }
+
+    std.debug.print("[*] Index bounds: Lat {d} Lon {d}\n", .{ max_lat_index, max_lon_index });
+    if (max_lat_index > known_max_lat_index) {
+        std.debug.panic("[!] Lat index {d} is higher than known max index {d}\n", .{ max_lat_index, known_max_lat_index });
+    }
+    if (max_lon_index > known_max_lon_index) {
+        std.debug.panic("[!] Lon index {d} is higher than known max index {d}\n", .{ max_lon_index, known_max_lon_index });
     }
 
     return try sectors.toOwnedSlice();
@@ -188,8 +207,8 @@ fn sortDistrictCodesFn(_: usize, lhs: DistrictCodePair, rhs: DistrictCodePair) b
 }
 
 fn unitToBytes(unit: RawUnit) [5]u8 {
-    const coordinates: u28 = @intCast((unit.lat_index << 14) | unit.lon_index);
-    const unit_code: u40 = (@as(u40, unit.code) << 28) | coordinates;
+    const coordinates: u29 = @intCast(unit.lon_index * known_max_lat_index + unit.lat_index);
+    const unit_code: u40 = (@as(u40, unit.code) << 29) | coordinates;
     return .{
         @intCast((unit_code >> 32) & 0xFF),
         @intCast((unit_code >> 24) & 0xFF),
