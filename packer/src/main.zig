@@ -105,14 +105,14 @@ fn createSector(allocator: std.mem.Allocator, district: DistrictCode, code: u8, 
     var current = units[0];
     sorted[0] = current;
 
-    const MAX_U64: u64 = 1 << 63;
+    const MAX_U64: u64 = (1 << 64) - 1;
 
     while (remaining.items.len > 0) {
         var min_encoded = MAX_U64;
         var best_index: usize = 0;
 
         for (remaining.items, 0..) |candidate, i| {
-            const encoded = encodeDelta(candidate, current) orelse MAX_U64;
+            const encoded = encodeDelta(current, candidate) orelse MAX_U64;
 
             if (encoded < min_encoded) {
                 min_encoded = encoded;
