@@ -4,7 +4,6 @@ const Sector = struct {
     district: DistrictCode,
     code: u8,
     units: []RawUnit,
-    z_index: u64,
 };
 
 const lat_min = 49.8;
@@ -15,11 +14,15 @@ const lon_res = 0.001;
 const known_max_lat_index = 50200;
 const known_max_lon_index = 9960;
 
+// code has less grouping, give it priority
+const delta0_max = 1024;
+const delta1_max = 64;
+const delta2_max = 64;
+
 const RawUnit = struct {
     code: u16,
     lat_index: u32,
     lon_index: u32,
-    z_index: u64,
 };
 
 const Postcode = struct {
@@ -88,18 +91,41 @@ fn createSector(allocator: std.mem.Allocator, district: DistrictCode, code: u8, 
     var sector = Sector{
         .district = district,
         .code = code,
-        .units = try allocator.dupe(RawUnit, units),
-        .z_index = 0,
+        .units = undefined,
     };
 
-    std.sort.block(RawUnit, sector.units, @as(usize, 0), sortUnitsFn);
+    const sorted = try allocator.alloc(RawUnit, units.len);
+    var storedCount: usize = 1;
 
-    var zIndexSum: usize = 0;
-    for (sector.units) |unit| {
-        zIndexSum +|= unit.z_index;
+    var remaining = try std.ArrayList(RawUnit).initCapacity(allocator, units.len - 1);
+    defer remaining.deinit();
+    remaining.expandToCapacity();
+    @memcpy(remaining.items, units[1..]);
+
+    var current = units[0];
+    sorted[0] = current;
+
+    const MAX_U64: u64 = 1 << 63;
+
+    while (remaining.items.len > 0) {
+        var min_encoded = MAX_U64;
+        var best_index: usize = 0;
+
+        for (remaining.items, 0..) |candidate, i| {
+            const encoded = encodeDelta(candidate, current) orelse MAX_U64;
+
+            if (encoded < min_encoded) {
+                min_encoded = encoded;
+                best_index = i;
+            }
+        }
+
+        current = remaining.orderedRemove(best_index);
+        sorted[storedCount] = current;
+        storedCount += 1;
     }
 
-    sector.z_index = zIndexSum / units.len;
+    sector.units = sorted;
 
     return sector;
 }
@@ -149,7 +175,6 @@ fn parseToSectors(allocator: std.mem.Allocator, district_map: *DistrictCodeMap, 
             .code = line.postcode.unit,
             .lat_index = lat_index,
             .lon_index = lon_index,
-            .z_index = interleave_bits(interleave_bits(lat_index, lon_index), line.postcode.unit),
         });
 
         lastSector = line.postcode.sector;
@@ -176,30 +201,8 @@ const DistrictCodePair = struct {
     index: DistrictCode,
 };
 
-fn spread_bits(n: u64) u64 {
-    var x: u64 = n & 0xFFFFFFFF;
-    x = (x | (x << 16)) & 0x0000FFFF0000FFFF;
-    x = (x | (x << 8)) & 0x00FF00FF00FF00FF;
-    x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0F;
-    x = (x | (x << 2)) & 0x3333333333333333;
-    x = (x | (x << 1)) & 0x5555555555555555;
-    return x;
-}
-
-fn interleave_bits(x: u64, y: u64) u64 {
-    return (spread_bits(x) << 1) | spread_bits(y);
-}
-
 fn zigzag(n: i32) u32 {
     return @intCast((n << 1) ^ (n >> 31));
-}
-
-fn sortUnitsFn(_: usize, lhs: RawUnit, rhs: RawUnit) bool {
-    return lhs.z_index < rhs.z_index;
-}
-
-fn sortSectorFn(_: usize, lhs: Sector, rhs: Sector) bool {
-    return lhs.z_index < rhs.z_index;
 }
 
 fn sortDistrictCodesFn(_: usize, lhs: DistrictCodePair, rhs: DistrictCodePair) bool {
@@ -216,6 +219,19 @@ fn unitToBytes(unit: RawUnit) [5]u8 {
         @intCast((unit_code >> 8) & 0xFF),
         @intCast(unit_code & 0xFF),
     };
+}
+
+fn encodeDelta(lastUnit: RawUnit, unit: RawUnit) ?u64 {
+    const delta = [3]u32{
+        zigzag(@as(i32, lastUnit.code) - @as(i32, unit.code)),
+        zigzag(@as(i32, @intCast(lastUnit.lat_index)) - @as(i32, @intCast(unit.lat_index))),
+        zigzag(@as(i32, @intCast(lastUnit.lon_index)) - @as(i32, @intCast(unit.lon_index))),
+    };
+
+    return if (delta[0] < delta0_max and delta[1] < delta1_max and delta[1] < delta2_max)
+        delta[2] * (delta1_max + 1) * (delta0_max + 1) + delta[1] * (delta0_max + 1) + delta[0]
+    else
+        null;
 }
 
 fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sectors: []const Sector) !std.ArrayList(u8) {
@@ -236,7 +252,6 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sec
 
     const owned_sectors = try allocator.dupe(Sector, sectors);
     defer allocator.free(owned_sectors);
-    std.sort.block(Sector, owned_sectors, @as(usize, 0), sortSectorFn);
 
     var bundle = std.ArrayList(u8).init(allocator);
 
@@ -255,22 +270,12 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sec
         try bundle.appendSlice(&std.mem.toBytes(@as(u16, @intCast(sector.units.len))));
         for (sector.units) |unit| {
             if (lastUnit) |lu| {
-                const delta = [3]u32{
-                    zigzag(@as(i32, lu.code) - @as(i32, unit.code)),
-                    zigzag(@as(i32, @intCast(lu.lat_index)) - @as(i32, @intCast(unit.lat_index))),
-                    zigzag(@as(i32, @intCast(lu.lon_index)) - @as(i32, @intCast(unit.lon_index))),
-                };
+                if (encodeDelta(lu, unit)) |delta| {
+                    var n: u64 = delta;
 
-                // code has less grouping, give it priority
-                const delta0_max = 1024;
-                const delta1_max = 64;
-                const delta2_max = 64;
-                if (delta[0] < delta0_max and delta[1] < delta1_max and delta[1] < delta2_max) {
-                    var encoded: u64 = delta[2] * (delta1_max + 1) * (delta0_max + 1) + delta[1] * (delta0_max + 1) + delta[0];
-
-                    while (encoded != 0) {
-                        const byte: u8 = @as(u8, @truncate(encoded)) & 0x7F;
-                        encoded >>= 7;
+                    while (n != 0) {
+                        const byte: u8 = @as(u8, @truncate(n)) & 0x7F;
+                        n >>= 7;
                         try bundle.append(byte | 0x80);
                     }
 
