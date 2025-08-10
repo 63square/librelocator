@@ -234,6 +234,40 @@ fn encodeDelta(lastUnit: RawUnit, unit: RawUnit) ?u64 {
         null;
 }
 
+fn sortSectors(allocator: std.mem.Allocator, sectors: []Sector) !void {
+    var storedCount: usize = 1;
+
+    var remaining = try std.ArrayList(Sector).initCapacity(allocator, sectors.len - 1);
+    defer remaining.deinit();
+    remaining.expandToCapacity();
+    @memcpy(remaining.items, sectors[1..]);
+
+    var current = sectors[0];
+
+    const MAX_U64: u64 = (1 << 64) - 1;
+
+    while (remaining.items.len > 0) {
+        var min_encoded = MAX_U64;
+        var best_index: usize = 0;
+
+        for (remaining.items, 0..) |candidate, i| {
+            const from_unit = current.units[current.units.len - 1];
+            const to_unit = candidate.units[0];
+
+            const encoded = encodeDelta(from_unit, to_unit) orelse MAX_U64;
+
+            if (encoded < min_encoded) {
+                min_encoded = encoded;
+                best_index = i;
+            }
+        }
+
+        current = remaining.orderedRemove(best_index);
+        sectors[storedCount] = current;
+        storedCount += 1;
+    }
+}
+
 fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sectors: []const Sector) !std.ArrayList(u8) {
     var districtMapIterator = district_map.iterator();
 
@@ -252,6 +286,8 @@ fn createBundle(allocator: std.mem.Allocator, district_map: DistrictCodeMap, sec
 
     const owned_sectors = try allocator.dupe(Sector, sectors);
     defer allocator.free(owned_sectors);
+
+    try sortSectors(allocator, owned_sectors);
 
     var bundle = std.ArrayList(u8).init(allocator);
 
